@@ -145,6 +145,7 @@ Connect to an SSH server using password or SSH key authentication.
 - `privateKey` (optional): Path to private SSH key file
 - `passphrase` (optional): Passphrase for encrypted private key
 - `connectionId` (optional): Unique identifier for this connection (default: "default")
+- `timeout` (optional): Connection handshake timeout in milliseconds, passed to ssh2 as `readyTimeout` (default: 60000). Set to `0` to disable.
 
 ### `ssh_execute`
 
@@ -178,6 +179,7 @@ Upload a file to the remote server via SFTP.
 - `remotePath` (required): Remote destination path
 - `connectionId` (optional): Connection ID to use (default: "default")
 - `createDirs` (optional): Create remote directories if they don't exist (default: true)
+- `timeout` (optional): Overall SFTP upload timeout in milliseconds, covers the full read-local + write-remote cycle (default: 60000).
 
 ### `ssh_download_file`
 
@@ -189,6 +191,7 @@ Download a file from the remote server via SFTP.
 - `localPath` (required): Local destination path
 - `connectionId` (optional): Connection ID to use (default: "default")
 - `createDirs` (optional): Create local directories if they don't exist (default: true)
+- `timeout` (optional): Overall SFTP download timeout in milliseconds, covers the full read-remote + write-local cycle (default: 60000).
 
 ### `ssh_list_files`
 
@@ -198,7 +201,8 @@ List files and directories on the remote server.
 
 - `remotePath` (optional): Remote directory path to list (default: ".")
 - `connectionId` (optional): Connection ID to use (default: "default")
-- `detailed` (optional): Show detailed file information (default: false)
+- `detailed` (optional): Show detailed file information (permissions, size, etc.) (default: false)
+- `timeout` (optional): SFTP readdir timeout in milliseconds (default: 60000).
 
 ## Examples
 
@@ -351,6 +355,22 @@ echo "Backup created: /tmp/backup_$timestamp.sql.gz"
 # Then download the backup
 ssh_download_file with remotePath="/tmp/backup_20241203_143022.sql.gz", localPath="./database_backup.sql.gz"
 ```
+
+## Timeouts
+
+Every tool that can block on I/O exposes a `timeout` parameter (in milliseconds). This lets the AI caller pick a value that matches the operation: a few seconds for a quick `ps` query, several minutes for a large `scp` upload.
+
+| Tool | Parameter | Bound to | Default |
+| --- | --- | --- | --- |
+| `ssh_connect` | `timeout` | ssh2 `readyTimeout` (handshake) | 60000 ms |
+| `ssh_execute` | `timeout` | Remote command execution | 30000 ms |
+| `ssh_execute_script` | `timeout` | Upload + remote script execution | 60000 ms |
+| `ssh_upload_and_execute` | `timeout` | Upload + remote script execution | 60000 ms |
+| `ssh_upload_file` | `timeout` | Full SFTP upload cycle (read-local + write-remote) | 60000 ms |
+| `ssh_download_file` | `timeout` | Full SFTP download cycle (read-remote + write-local) | 60000 ms |
+| `ssh_list_files` | `timeout` | SFTP `readdir` call | 60000 ms |
+
+All `timeout` values must be non-negative finite numbers. Set to `0` to disable on `ssh_connect` (the only tool where the underlying ssh2 client supports this). For SFTP tools, the MCP server enforces a hard upper bound via `Promise.race`: when the timer fires, the call rejects with `<tool> timed out after <N>ms`, so the AI caller is never stuck waiting on a stalled connection. (ssh2 does not expose a cancel handle for in-flight SFTP work, so the underlying transfer may continue server-side until the SSH channel is closed; use `ssh_disconnect` to force-stop.)
 
 ## Security Considerations
 

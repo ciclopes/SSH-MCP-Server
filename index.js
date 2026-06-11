@@ -74,6 +74,13 @@ class SSHMCPServer {
                 description: 'Unique identifier for this connection',
                 default: 'default',
               },
+              timeout: {
+                type: 'number',
+                description:
+                  'Connection handshake timeout in milliseconds (passed to ssh2 as readyTimeout). Use 0 to disable. Default: 60000.',
+                default: 60000,
+                minimum: 0,
+              },
             },
             required: ['host', 'username'],
           },
@@ -220,6 +227,13 @@ class SSHMCPServer {
                 description: 'Create remote directories if they don\'t exist',
                 default: true,
               },
+              timeout: {
+                type: 'number',
+                description:
+                  'Overall SFTP upload timeout in milliseconds (covers the full read-local + write-remote cycle). Default: 60000.',
+                default: 60000,
+                minimum: 0,
+              },
             },
             required: ['localPath', 'remotePath'],
           },
@@ -248,6 +262,13 @@ class SSHMCPServer {
                 description: 'Create local directories if they don\'t exist',
                 default: true,
               },
+              timeout: {
+                type: 'number',
+                description:
+                  'Overall SFTP download timeout in milliseconds (covers the full read-remote + write-local cycle). Default: 60000.',
+                default: 60000,
+                minimum: 0,
+              },
             },
             required: ['remotePath', 'localPath'],
           },
@@ -272,6 +293,13 @@ class SSHMCPServer {
                 type: 'boolean',
                 description: 'Show detailed file information (permissions, size, etc.)',
                 default: false,
+              },
+              timeout: {
+                type: 'number',
+                description:
+                  'SFTP readdir timeout in milliseconds. Default: 60000.',
+                default: 60000,
+                minimum: 0,
               },
             },
           },
@@ -328,10 +356,15 @@ class SSHMCPServer {
       privateKey,
       passphrase,
       connectionId = 'default',
+      timeout = 60000,
     } = args;
 
     if (this.connections.has(connectionId)) {
       throw new Error(`Connection '${connectionId}' already exists. Disconnect first or use a different ID.`);
+    }
+
+    if (typeof timeout !== 'number' || !Number.isFinite(timeout) || timeout < 0) {
+      throw new Error(`Invalid timeout: must be a non-negative finite number of milliseconds (got ${timeout})`);
     }
 
     return new Promise((resolve, reject) => {
@@ -341,7 +374,7 @@ class SSHMCPServer {
         host,
         port,
         username,
-        readyTimeout: 60000,
+        readyTimeout: timeout,
       };
 
       // Handle IPv6 addresses
@@ -505,6 +538,23 @@ class SSHMCPServer {
     const codeBlockRegex = /^```[\w]*\n?([\s\S]*?)\n?```$/;
     const match = script.trim().match(codeBlockRegex);
     return match ? match[1].trim() : script.trim();
+  }
+
+  // Wrap a promise-returning operation with a hard upper-bound timeout.
+  // ssh2 callback-style APIs don't expose a cancel handle we can rely on, so
+  // we can't always kill the in-flight work — but Promise.race guarantees the
+  // MCP call returns within `timeoutMs` so the AI caller isn't stuck waiting
+  // on a stalled connection.
+  withTimeout(promise, timeoutMs, label) {
+    let guardTimer;
+    const guard = new Promise((_, reject) => {
+      guardTimer = setTimeout(() => {
+        reject(new Error(`${label} timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
+    });
+    return Promise.race([promise, guard]).finally(() => {
+      clearTimeout(guardTimer);
+    });
   }
 
   async handleSSHExecuteScript(args) {
@@ -685,20 +735,24 @@ class SSHMCPServer {
   }
 
   async handleSSHUploadFile(args) {
-    const { localPath, remotePath, connectionId = 'default', createDirs = true } = args;
+    const { localPath, remotePath, connectionId = 'default', createDirs = true, timeout = 60000 } = args;
 
     const conn = this.connections.get(connectionId);
     if (!conn) {
       throw new Error(`No active connection found for ID: ${connectionId}`);
     }
 
+    if (typeof timeout !== 'number' || !Number.isFinite(timeout) || timeout < 0) {
+      throw new Error(`Invalid timeout: must be a non-negative finite number of milliseconds (got ${timeout})`);
+    }
+
     const absoluteLocalPath = resolve(localPath);
 
-    return new Promise((resolve, reject) => {
+    const work = new Promise((resolve, reject) => {
       // Check if local file exists
       try {
         const fileContent = readFileSync(absoluteLocalPath);
-        
+
         conn.sftp((err, sftp) => {
           if (err) {
             return reject(new Error(`SFTP error: ${err.message}`));
@@ -743,19 +797,25 @@ class SSHMCPServer {
         reject(new Error(`Failed to read local file: ${error.message}`));
       }
     });
+
+    return this.withTimeout(work, timeout, 'ssh_upload_file');
   }
 
   async handleSSHDownloadFile(args) {
-    const { remotePath, localPath, connectionId = 'default', createDirs = true } = args;
+    const { remotePath, localPath, connectionId = 'default', createDirs = true, timeout = 60000 } = args;
 
     const conn = this.connections.get(connectionId);
     if (!conn) {
       throw new Error(`No active connection found for ID: ${connectionId}`);
     }
 
+    if (typeof timeout !== 'number' || !Number.isFinite(timeout) || timeout < 0) {
+      throw new Error(`Invalid timeout: must be a non-negative finite number of milliseconds (got ${timeout})`);
+    }
+
     const absoluteLocalPath = resolve(localPath);
 
-    return new Promise((resolve, reject) => {
+    const work = new Promise((resolve, reject) => {
       conn.sftp((err, sftp) => {
         if (err) {
           return reject(new Error(`SFTP error: ${err.message}`));
@@ -802,17 +862,23 @@ class SSHMCPServer {
         downloadFile();
       });
     });
+
+    return this.withTimeout(work, timeout, 'ssh_download_file');
   }
 
   async handleSSHListFiles(args) {
-    const { remotePath = '.', connectionId = 'default', detailed = false } = args;
+    const { remotePath = '.', connectionId = 'default', detailed = false, timeout = 60000 } = args;
 
     const conn = this.connections.get(connectionId);
     if (!conn) {
       throw new Error(`No active connection found for ID: ${connectionId}`);
     }
 
-    try {
+    if (typeof timeout !== 'number' || !Number.isFinite(timeout) || timeout < 0) {
+      throw new Error(`Invalid timeout: must be a non-negative finite number of milliseconds (got ${timeout})`);
+    }
+
+    const work = (async () => {
       const sftp = await new Promise((resolve, reject) => {
         conn.sftp((err, sftp) => {
           if (err) {
@@ -836,30 +902,30 @@ class SSHMCPServer {
       if (detailed) {
         output += 'Permissions  Size     Modified                Name\n';
         output += '-'.repeat(60) + '\n';
-        
+
         list.forEach(item => {
           const isDir = item.attrs.isDirectory() ? 'd' : '-';
           const perms = item.attrs.mode ? (item.attrs.mode & parseInt('777', 8)).toString(8).padStart(3, '0') : '???';
           const size = item.attrs.size ? item.attrs.size.toString().padStart(8) : '???';
           const mtime = item.attrs.mtime ? new Date(item.attrs.mtime * 1000).toISOString() : 'Unknown';
-          
+
           output += `${isDir}${perms}      ${size}   ${mtime}  ${item.filename}\n`;
         });
       } else {
         const dirs = list.filter(item => item.attrs.isDirectory()).map(item => item.filename + '/');
         const files = list.filter(item => !item.attrs.isDirectory()).map(item => item.filename);
-        
+
         if (dirs.length > 0) {
           output += 'Directories:\n';
           dirs.forEach(dir => output += `  ${dir}\n`);
           output += '\n';
         }
-        
+
         if (files.length > 0) {
           output += 'Files:\n';
           files.forEach(file => output += `  ${file}\n`);
         }
-        
+
         if (dirs.length === 0 && files.length === 0) {
           output += 'Directory is empty';
         }
@@ -873,9 +939,9 @@ class SSHMCPServer {
           },
         ],
       };
-    } catch (error) {
-      throw error;
-    }
+    })();
+
+    return this.withTimeout(work, timeout, 'ssh_list_files');
   }
 
   async run() {
