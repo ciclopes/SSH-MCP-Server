@@ -8,8 +8,9 @@ import {
 } from '@modelcontextprotocol/sdk/types.js';
 import { Client } from 'ssh2';
 import { readFileSync, writeFileSync, mkdirSync } from 'fs';
-import { resolve, basename, dirname } from 'path';
+import { resolve, basename, dirname, isAbsolute } from 'path';
 import { fileURLToPath } from 'url';
+import { homedir } from 'os';
 
 // Get package.json version
 const __filename = fileURLToPath(import.meta.url);
@@ -335,11 +336,12 @@ class SSHMCPServer {
 
     return new Promise((resolve, reject) => {
       const conn = new Client();
-      
+
       const config = {
         host,
         port,
         username,
+        readyTimeout: 60000,
       };
 
       // Handle IPv6 addresses
@@ -350,9 +352,38 @@ class SSHMCPServer {
       // Authentication setup
       if (privateKey) {
         try {
-          const keyPath = resolve(privateKey);
+          // Expand a leading "~" or "~/" / "~\" to the user's home directory
+          // before any further path processing. ssh-keygen and ssh(1) accept
+          // tilde-prefixed paths; we should too.
+          let inputPath = privateKey;
+          if (typeof inputPath === 'string' && (inputPath === '~' || inputPath.startsWith('~/') || inputPath.startsWith('~\\'))) {
+            inputPath = homedir() + inputPath.slice(1);
+          }
+          // IMPORTANT: when this MCP server is spawned with a UNC working
+          // directory (e.g. \\server\share\path on Windows, which happens
+          // when the parent process is operating in a network-mounted or
+          // WSL-distributed project path), Node's path.resolve() can return
+          // undefined for what should be a perfectly valid absolute path. We
+          // therefore only fall back to path.resolve() when the input is NOT
+          // already a platform-recognized absolute path. This covers:
+          //   - Windows drive-letter paths:  C:\Users\...  or  D:/foo/bar
+          //   - Windows UNC paths:           \\server\share\path
+          //   - Windows extended paths:      \\?\C:\very\long\path
+          //   - POSIX absolute paths:        /home/user/.ssh/id_ed25519
+          // We also pass the key as a UTF-8 string (not a Buffer): ssh2@1.17.0
+          // has a bug where a Buffer for an OpenSSH-format ed25519 private
+          // key causes a 'Cannot convert undefined or null to object' error
+          // after the handshake completes. Passing a string forces ssh2 to
+          // use its internal parseKey path which handles the OpenSSH format
+          // correctly.
+          const isWinAbs = process.platform === 'win32' && (
+            /^[A-Za-z]:[\\\/]/.test(inputPath) ||       // C:\...  C:/...
+            inputPath.startsWith('\\\\')                // UNC \\server\...
+          );
+          const isAlreadyAbsolute = isWinAbs || isAbsolute(inputPath);
+          const keyPath = isAlreadyAbsolute ? inputPath : resolve(inputPath);
           const keyData = readFileSync(keyPath);
-          config.privateKey = keyData;
+          config.privateKey = keyData.toString('utf8');
           if (passphrase) {
             config.passphrase = passphrase;
           }
