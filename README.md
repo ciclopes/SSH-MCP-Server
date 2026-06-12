@@ -149,13 +149,19 @@ Connect to an SSH server using password or SSH key authentication.
 
 ### `ssh_execute`
 
-Execute a command on an established SSH connection.
+Execute a command on an established SSH connection. Commands run in a **persistent shell session** (one per connection), so shell state — working directory (`cd`), environment variables (`export`), sourced virtualenvs, etc. — persists between calls, just like in a real terminal.
 
 **Parameters:**
 
 - `command` (required): Command to execute on the remote server
 - `connectionId` (optional): Connection ID to use (default: "default")
 - `timeout` (optional): Command timeout in milliseconds (default: 30000)
+
+**Notes:**
+
+- The remote login shell must be POSIX-compatible (bash, zsh, sh, dash). csh/fish are not supported.
+- If a command runs `exit`, the shell session ends; the call returns an error and the next `ssh_execute` transparently opens a fresh shell (state is reset).
+- On timeout the shell cannot be interrupted individually (no PTY), so the whole connection is dropped — reconnect with `ssh_connect`.
 
 ### `ssh_disconnect`
 
@@ -370,7 +376,12 @@ Every tool that can block on I/O exposes a `timeout` parameter (in milliseconds)
 | `ssh_download_file` | `timeout` | Full SFTP download cycle (read-remote + write-local) | 60000 ms |
 | `ssh_list_files` | `timeout` | SFTP `readdir` call | 60000 ms |
 
-All `timeout` values must be non-negative finite numbers. Set to `0` to disable on `ssh_connect` (the only tool where the underlying ssh2 client supports this). For SFTP tools, the MCP server enforces a hard upper bound via `Promise.race`: when the timer fires, the call rejects with `<tool> timed out after <N>ms`, so the AI caller is never stuck waiting on a stalled connection. (ssh2 does not expose a cancel handle for in-flight SFTP work, so the underlying transfer may continue server-side until the SSH channel is closed; use `ssh_disconnect` to force-stop.)
+All `timeout` values must be non-negative finite numbers. Set to `0` to disable on `ssh_connect` (the only tool where the underlying ssh2 client supports this). When the timer fires, the call rejects with `<tool> timed out after <N>ms` and the work is **actually cancelled**, not just abandoned locally:
+
+- **SFTP tools** (`ssh_upload_file`, `ssh_download_file`, `ssh_list_files`): the in-flight stream is destroyed and the SSH connection torn down, which stops the transfer server-side.
+- **Command tools** (`ssh_execute`, `ssh_execute_script`, `ssh_upload_and_execute`): because a non-PTY remote command keeps running after the client disconnects, on timeout the server opens a parallel channel and **kills the remote command's process group** (`SIGTERM` then `SIGKILL`) before dropping the connection — so a hung `sleep`, build, or query does not keep running on the host behind your back. This requires the standard `pgrep`/`ps`/`kill` utilities on the remote (present on essentially every Linux/BSD/macOS host).
+
+After a timeout the connection is dropped from the pool; reconnect with `ssh_connect`.
 
 ## Security Considerations
 

@@ -46,6 +46,7 @@
   },
   "files": [
     "index.js",
+    "lib/",
     "README.md",
     "package.json",
     "manifest.json"

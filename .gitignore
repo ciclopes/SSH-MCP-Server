@@ -104,3 +104,9 @@ id_rsa*
 *.ppk
 *.zip
 *.dxt
+
+# Other
+.claude
+.codex
+.gemini
+.hermes

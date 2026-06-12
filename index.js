@@ -7,6 +7,7 @@ import {
   CallToolRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
 import { Client } from 'ssh2';
+import { ShellSession } from './lib/shell-session.js';
 import { readFileSync, writeFileSync, mkdirSync } from 'fs';
 import { resolve as pathResolve, basename, dirname, isAbsolute } from 'path';
 import { fileURLToPath } from 'url';
@@ -16,6 +17,24 @@ import { homedir } from 'os';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const packageJson = JSON.parse(readFileSync(pathResolve(__dirname, 'package.json'), 'utf8'));
+
+// Build a remote command that finds the process(es) running our uploaded
+// script (matched by its unique name) and SIGTERM-then-SIGKILLs their whole
+// process group, so child processes (e.g. a `sleep` the script spawned) die
+// too. The first character is wrapped in a regex class — the classic
+// `[m]cp_temp...` trick — so this kill command's OWN process line (which
+// contains the literal pattern) is not matched by pgrep, avoiding a
+// self-kill. `scriptName` is server-generated (mcp_temp_<digits>.<ext>), so
+// there is nothing to escape.
+function buildScriptKillCommand(scriptName) {
+  const pattern = `[${scriptName[0]}]${scriptName.slice(1)}`;
+  return (
+    `for __pid in $(pgrep -f '${pattern}' 2>/dev/null); do ` +
+    `__pgid=$(ps -o pgid= -p "$__pid" 2>/dev/null | tr -d ' '); ` +
+    `[ -n "$__pgid" ] && { kill -TERM -- -"$__pgid" 2>/dev/null; sleep 0.3; kill -KILL -- -"$__pgid" 2>/dev/null; }; ` +
+    `done; true`
+  );
+}
 
 class SSHMCPServer {
   constructor() {
@@ -32,6 +51,10 @@ class SSHMCPServer {
     );
 
     this.connections = new Map();
+    // One persistent ShellSession (promise) per connectionId, created
+    // lazily on the first ssh_execute. Keeping the shell alive between
+    // calls is what makes ssh_execute stateful (cd, export, ...).
+    this.shells = new Map();
     this.setupToolHandlers();
   }
 
@@ -87,7 +110,7 @@ class SSHMCPServer {
         },
         {
           name: 'ssh_execute',
-          description: 'Execute a command on an established SSH connection',
+          description: 'Execute a command on an established SSH connection. The session is stateful: working directory (cd), environment variables (export) and other shell state persist across calls on the same connection.',
           inputSchema: {
             type: 'object',
             properties: {
@@ -456,10 +479,76 @@ class SSHMCPServer {
 
       conn.on('close', () => {
         this.connections.delete(connectionId);
+        this.shells.delete(connectionId);
       });
 
       conn.connect(config);
     });
+  }
+
+  // Best-effort fire-and-forget command on a PARALLEL exec channel.
+  //
+  // This is the load-bearing piece of timeout cancellation: without a PTY,
+  // tearing down the SSH connection does NOT signal a running remote command
+  // (processes that don't touch stdin/stdout — `sleep`, a long compile, ...
+  // — keep running on the server after the client disconnects). So before we
+  // drop the connection we open a second channel and `kill` the hung
+  // command's process group here, while the original (wedged) channel is
+  // still up.
+  //
+  // Resolves when the kill finishes or after `safetyMs`, whichever comes
+  // first — the cancel path must never hang on a stalled connection.
+  runRemoteKill(conn, killCommand, safetyMs = 3000) {
+    return new Promise((resolve) => {
+      if (!conn || !killCommand) return resolve();
+      let done = false;
+      const finish = () => {
+        if (done) return;
+        done = true;
+        clearTimeout(safety);
+        resolve();
+      };
+      const safety = setTimeout(finish, safetyMs);
+      if (safety.unref) safety.unref();
+      try {
+        conn.exec(killCommand, {}, (err, stream) => {
+          if (err) return finish();
+          stream.on('data', () => {});
+          stream.stderr.on('data', () => {});
+          stream.on('close', finish);
+          stream.on('error', finish);
+        });
+      } catch (_) {
+        finish();
+      }
+    });
+  }
+
+  // Get (or lazily create) the persistent shell session for a connection.
+  // The map stores the *promise* so two concurrent ssh_execute calls on the
+  // same connection share one shell instead of racing to open two.
+  async getShell(connectionId, conn) {
+    const existingPromise = this.shells.get(connectionId);
+    if (existingPromise) {
+      const existing = await existingPromise.catch(() => null);
+      if (existing && !existing.closed) {
+        return existing;
+      }
+      if (this.shells.get(connectionId) === existingPromise) {
+        this.shells.delete(connectionId);
+      }
+    }
+    let sessionPromise = this.shells.get(connectionId);
+    if (!sessionPromise) {
+      sessionPromise = ShellSession.open(conn);
+      this.shells.set(connectionId, sessionPromise);
+      sessionPromise.catch(() => {
+        if (this.shells.get(connectionId) === sessionPromise) {
+          this.shells.delete(connectionId);
+        }
+      });
+    }
+    return sessionPromise;
   }
 
   async handleSSHExecute(args) {
@@ -474,14 +563,35 @@ class SSHMCPServer {
       throw new Error(`Invalid timeout: must be a non-negative finite number of milliseconds (got ${timeout})`);
     }
 
-    // Multi-layer cancel: the exec stream is a Duplex from ssh2; we close
-    // it gracefully (sends EOF) and, as a last resort, destroy the SSH
-    // socket. Same pattern as the SFTP handlers.
-    let activeStream = null;
-    const cancel = () => {
-      if (activeStream && !activeStream.destroyed) {
-        try { activeStream.close(); } catch (_) {}
-        try { activeStream.destroy(new Error('timeout')); } catch (_) {}
+    // ssh_execute runs on a persistent shell channel (one per connection)
+    // so state persists between calls. A hung command therefore wedges the
+    // whole shell: on timeout we destroy the shell stream AND the SSH
+    // connection, same as the other handlers' last-resort cancel.
+    //
+    // `cancelled` (not stream.destroyed) distinguishes "our timeout killed
+    // the stream" from "the stream auto-destroyed after finishing": modern
+    // Node streams have destroyed === true by the time 'close' fires even
+    // on success, so destroyed-based guards swallow legitimate results.
+    let cancelled = false;
+    const cancel = async () => {
+      cancelled = true;
+      const sessionPromise = this.shells.get(connectionId);
+      this.shells.delete(connectionId);
+      let session = null;
+      if (sessionPromise) {
+        try { session = await Promise.resolve(sessionPromise); } catch (_) {}
+      }
+      // Kill the hung command's process group via a PARALLEL channel, while
+      // the connection is still up. The shell is its group leader, so the
+      // foreground command shares its group and dies with it.
+      if (session && session.pid) {
+        await this.runRemoteKill(
+          conn,
+          `kill -TERM -- -${session.pid} 2>/dev/null; sleep 0.3; kill -KILL -- -${session.pid} 2>/dev/null; true`,
+        );
+      }
+      if (session && session.stream && !session.stream.destroyed) {
+        try { session.stream.destroy(new Error('timeout')); } catch (_) {}
       }
       try { conn.end(); } catch (_) {}
       if (conn._sock && !conn._sock.destroyed) {
@@ -492,44 +602,39 @@ class SSHMCPServer {
       }
     };
 
-    const work = () => new Promise((resolve, reject) => {
-      let output = '';
-      let errorOutput = '';
-
-      conn.exec(command, (err, stream) => {
-        if (err) {
-          return reject(new Error(`Failed to execute command: ${err.message}`));
+    const work = async () => {
+      const session = await this.getShell(connectionId, conn);
+      let result;
+      try {
+        result = await session.exec(command);
+      } catch (err) {
+        if (cancelled) {
+          // Our timeout cancel destroyed the shell mid-command. Never
+          // settle — withTimeout rejects with the timeout error.
+          return new Promise(() => {});
         }
-        activeStream = stream;
-
-        stream
-          .on('close', (code, signal) => {
-            // Skip the resolve path if our cancel destroyed the stream —
-            // withTimeout will reject with the timeout error.
-            if (stream.destroyed) return;
-            resolve({
-              content: [
-                {
-                  type: 'text',
-                  text: `Command: ${command}\nExit Code: ${code}\n${signal ? `Signal: ${signal}\n` : ''}Output:\n${output}${errorOutput ? `\nError Output:\n${errorOutput}` : ''}`,
-                },
-              ],
-            });
-          })
-          .on('data', (data) => {
-            output += data.toString();
-          })
-          .stderr.on('data', (data) => {
-            errorOutput += data.toString();
-          });
-      });
-    });
+        // Natural shell death (e.g. the command called `exit`): drop the
+        // dead session so the next ssh_execute opens a fresh shell, then
+        // surface the error.
+        this.shells.delete(connectionId);
+        throw err;
+      }
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `Command: ${command}\nExit Code: ${result.code}\nOutput:\n${result.stdout}${result.stderr ? `\nError Output:\n${result.stderr}` : ''}`,
+          },
+        ],
+      };
+    };
 
     try {
       return await this.withTimeout(work, timeout, 'ssh_execute', cancel);
     } catch (err) {
       if (err && /timed out/.test(err.message)) {
         this.connections.delete(connectionId);
+        this.shells.delete(connectionId);
       }
       throw err;
     }
@@ -545,6 +650,7 @@ class SSHMCPServer {
 
     conn.end();
     this.connections.delete(connectionId);
+    this.shells.delete(connectionId);
 
     return {
       content: [
@@ -650,11 +756,26 @@ class SSHMCPServer {
     // Extract code from blocks if present
     const cleanScript = this.extractCodeFromBlock(script);
 
+    // Create a temporary script file and execute it. Defined out here (not
+    // inside work) so the cancel path can target the running script's
+    // process group by its unique remote path.
+    const scriptName = `mcp_temp_${Date.now()}.${interpreter === 'python' || interpreter === 'python3' ? 'py' : 'sh'}`;
+    const remotePath = `/tmp/${scriptName}`;
+
     // Two in-flight streams: the SFTP writeStream for the script upload
     // and the exec stream once the upload completes. Cancel must clear
-    // whichever is active.
+    // whichever is active. `cancelled` (not stream.destroyed) gates the
+    // event handlers: streams auto-destroy after a clean finish, so
+    // destroyed-based guards would swallow successful results.
     let activeStream = null;
-    const cancel = () => {
+    let cancelled = false;
+    const cancel = async () => {
+      cancelled = true;
+      // Kill the running script's process group via a PARALLEL channel
+      // before teardown — dropping the connection alone leaves a non-PTY
+      // remote command running. No-op if the timeout fired during upload
+      // (nothing matches the pattern yet).
+      await this.runRemoteKill(conn, buildScriptKillCommand(scriptName));
       if (activeStream && !activeStream.destroyed) {
         try { activeStream.destroy(new Error('timeout')); } catch (_) {}
       }
@@ -670,10 +791,6 @@ class SSHMCPServer {
     const work = () => new Promise((resolve, reject) => {
       let output = '';
       let errorOutput = '';
-
-      // Create a temporary script file and execute it
-      const scriptName = `mcp_temp_${Date.now()}.${interpreter === 'python' || interpreter === 'python3' ? 'py' : 'sh'}`;
-      const remotePath = `/tmp/${scriptName}`;
 
       // Prepare the script content with proper shebang
       let scriptContent = cleanScript;
@@ -696,7 +813,7 @@ class SSHMCPServer {
         writeStream.end();
 
         writeStream.on('close', () => {
-          if (writeStream.destroyed) return;
+          if (cancelled) return;
           // Make script executable and run it
           const cdCommand = workingDir ? `cd "${workingDir}" && ` : '';
           const command = `${cdCommand}chmod +x ${remotePath} && ${remotePath} && rm -f ${remotePath}`;
@@ -709,7 +826,7 @@ class SSHMCPServer {
 
             stream
               .on('close', (code, signal) => {
-                if (stream.destroyed) return;
+                if (cancelled) return;
                 resolve({
                   content: [
                     {
@@ -731,7 +848,7 @@ class SSHMCPServer {
         writeStream.on('error', (uploadErr) => {
           // If our cancel destroyed the stream, let withTimeout reject
           // with the timeout error.
-          if (writeStream.destroyed) return;
+          if (cancelled) return;
           reject(new Error(`Failed to upload script: ${uploadErr.message}`));
         });
       });
@@ -769,10 +886,21 @@ class SSHMCPServer {
     // Extract code from blocks if present
     const cleanScript = this.extractCodeFromBlock(script);
 
+    // Defined out here so the cancel path can target the running script's
+    // process group by its unique remote name.
+    const remoteName = basename(filename);
+    const remotePath = `/tmp/${remoteName}`;
+
     // Same two-stream cancel as handleSSHExecuteScript: write stream
-    // for the script upload, exec stream once it's on disk.
+    // for the script upload, exec stream once it's on disk. `cancelled`
+    // gates the event handlers (see handleSSHExecuteScript).
     let activeStream = null;
-    const cancel = () => {
+    let cancelled = false;
+    const cancel = async () => {
+      cancelled = true;
+      // Kill the running script's process group via a PARALLEL channel
+      // before teardown (see handleSSHExecuteScript).
+      await this.runRemoteKill(conn, buildScriptKillCommand(remoteName));
       if (activeStream && !activeStream.destroyed) {
         try { activeStream.destroy(new Error('timeout')); } catch (_) {}
       }
@@ -788,8 +916,6 @@ class SSHMCPServer {
     const work = () => new Promise((resolve, reject) => {
       let output = '';
       let errorOutput = '';
-
-      const remotePath = `/tmp/${basename(filename)}`;
 
       // Prepare the script content
       let scriptContent = cleanScript;
@@ -812,7 +938,7 @@ class SSHMCPServer {
         writeStream.end();
 
         writeStream.on('close', () => {
-          if (writeStream.destroyed) return;
+          if (cancelled) return;
           // Make script executable and run it
           const cleanupCmd = cleanup ? ` && rm -f ${remotePath}` : '';
           const command = `chmod +x ${remotePath} && ${remotePath}${cleanupCmd}`;
@@ -825,7 +951,7 @@ class SSHMCPServer {
 
             stream
               .on('close', (code, signal) => {
-                if (stream.destroyed) return;
+                if (cancelled) return;
                 resolve({
                   content: [
                     {
@@ -845,7 +971,7 @@ class SSHMCPServer {
         });
 
         writeStream.on('error', (uploadErr) => {
-          if (writeStream.destroyed) return;
+          if (cancelled) return;
           reject(new Error(`Failed to upload script: ${uploadErr.message}`));
         });
       });
@@ -883,8 +1009,15 @@ class SSHMCPServer {
     //   3. As a last resort, destroy the underlying SSH Client (forces the
     //      server to abort via TCP close). Note: this also kills any other
     //      in-flight operations on the same connectionId.
+    //
+    // `cancelled` (not stream.destroyed) gates the event handlers below:
+    // modern Node streams auto-destroy after a clean finish, so destroyed
+    // is already true when 'close' fires even on success — a destroyed-
+    // based guard turns every successful upload into a fake timeout.
     let activeStream = null;
+    let cancelled = false;
     const cancel = () => {
+      cancelled = true;
       if (activeStream && !activeStream.destroyed) {
         try { activeStream.destroy(new Error('timeout')); } catch (_) {}
       }
@@ -920,7 +1053,7 @@ class SSHMCPServer {
 
             writeStream.on('close', () => {
               // Only resolve if not already settled by timeout.
-              if (writeStream.destroyed) return;
+              if (cancelled) return;
               resolve({
                 content: [
                   {
@@ -932,17 +1065,10 @@ class SSHMCPServer {
             });
 
             writeStream.on('error', (writeErr) => {
-              // Our cancel destroyed the stream: let withTimeout reject
-              // with the timeout error.
-              if (writeStream.destroyed && writeErr && writeErr.message === 'timeout') {
-                return;
-              }
-              // Our cancel called conn.end() (graceful) before destroy
-              // could set the 'timeout' message: the stream then errors
-              // with a generic SFTP/SSH error. Treat as timeout too.
-              if (writeStream.destroyed) {
-                return;
-              }
+              // Our cancel killed the stream (directly or via conn.end()):
+              // stay quiet and let withTimeout reject with the timeout
+              // error.
+              if (cancelled) return;
               reject(new Error(`Upload failed: ${writeErr.message}`));
             });
           };
@@ -997,8 +1123,11 @@ class SSHMCPServer {
     //   1. Destroy the read stream (closes the remote file handle).
     //   2. End the SFTP session.
     //   3. Force-destroy the SSH socket as the last resort.
+    // `cancelled` gates the event handlers (see handleSSHUploadFile).
     let activeStream = null;
+    let cancelled = false;
     const cancel = () => {
+      cancelled = true;
       if (activeStream && !activeStream.destroyed) {
         try { activeStream.destroy(new Error('timeout')); } catch (_) {}
       }
@@ -1027,7 +1156,7 @@ class SSHMCPServer {
           });
 
           readStream.on('end', () => {
-            if (readStream.destroyed) return;
+            if (cancelled) return;
             try {
               writeFileSync(absoluteLocalPath, fileContent);
               resolve({
@@ -1044,18 +1173,9 @@ class SSHMCPServer {
           });
 
           readStream.on('error', (readErr) => {
-            // Our cancel destroyed the stream: ignore and let withTimeout
-            // reject with the timeout error.
-            if (readStream.destroyed && readErr && readErr.message === 'timeout') {
-              return;
-            }
-            // Our cancel called conn.end() (graceful) before destroy had a
-            // chance to set the 'timeout' message: the stream then errors
-            // with a generic "No response from server" / "Connection lost"
-            // as the SFTP session closes. Treat this as the timeout too.
-            if (readStream.destroyed) {
-              return;
-            }
+            // Our cancel killed the stream (directly or via conn.end()):
+            // ignore and let withTimeout reject with the timeout error.
+            if (cancelled) return;
             reject(new Error(`Download failed: ${readErr.message}`));
           });
         };
