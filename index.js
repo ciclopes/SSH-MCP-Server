@@ -8,14 +8,14 @@ import {
 } from '@modelcontextprotocol/sdk/types.js';
 import { Client } from 'ssh2';
 import { readFileSync, writeFileSync, mkdirSync } from 'fs';
-import { resolve, basename, dirname, isAbsolute } from 'path';
+import { resolve as pathResolve, basename, dirname, isAbsolute } from 'path';
 import { fileURLToPath } from 'url';
 import { homedir } from 'os';
 
 // Get package.json version
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
-const packageJson = JSON.parse(readFileSync(resolve(__dirname, 'package.json'), 'utf8'));
+const packageJson = JSON.parse(readFileSync(pathResolve(__dirname, 'package.json'), 'utf8'));
 
 class SSHMCPServer {
   constructor() {
@@ -410,13 +410,22 @@ class SSHMCPServer {
           // use its internal parseKey path which handles the OpenSSH format
           // correctly.
           const isWinAbs = process.platform === 'win32' && (
-            /^[A-Za-z]:[\\\/]/.test(inputPath) ||       // C:\...  C:/...
+            /^[A-Za-z]:[\\/]/.test(inputPath) ||       // C:\... or C:/...
             inputPath.startsWith('\\\\')                // UNC \\server\...
           );
-          const isAlreadyAbsolute = isWinAbs || isAbsolute(inputPath);
-          const keyPath = isAlreadyAbsolute ? inputPath : resolve(inputPath);
-          const keyData = readFileSync(keyPath);
-          config.privateKey = keyData.toString('utf8');
+          // If privateKey is the key content (OpenSSH PEM begins with
+          // "-----BEGIN"), skip the filesystem lookup and use the string
+          // as-is. ssh2 accepts both a path and a key string.
+          const looksLikePem = typeof inputPath === 'string'
+            && inputPath.trimStart().startsWith('-----BEGIN');
+          if (looksLikePem) {
+            config.privateKey = inputPath;
+          } else {
+            const isAlreadyAbsolute = isWinAbs || isAbsolute(inputPath);
+            const keyPath = isAlreadyAbsolute ? inputPath : pathResolve(inputPath);
+            const keyData = readFileSync(keyPath);
+            config.privateKey = keyData.toString('utf8');
+          }
           if (passphrase) {
             config.passphrase = passphrase;
           }
@@ -461,23 +470,43 @@ class SSHMCPServer {
       throw new Error(`No active connection found for ID: ${connectionId}`);
     }
 
-    return new Promise((resolve, reject) => {
+    if (typeof timeout !== 'number' || !Number.isFinite(timeout) || timeout < 0) {
+      throw new Error(`Invalid timeout: must be a non-negative finite number of milliseconds (got ${timeout})`);
+    }
+
+    // Multi-layer cancel: the exec stream is a Duplex from ssh2; we close
+    // it gracefully (sends EOF) and, as a last resort, destroy the SSH
+    // socket. Same pattern as the SFTP handlers.
+    let activeStream = null;
+    const cancel = () => {
+      if (activeStream && !activeStream.destroyed) {
+        try { activeStream.close(); } catch (_) {}
+        try { activeStream.destroy(new Error('timeout')); } catch (_) {}
+      }
+      try { conn.end(); } catch (_) {}
+      if (conn._sock && !conn._sock.destroyed) {
+        setTimeout(() => {
+          try { if (conn._sock && !conn._sock.destroyed) conn._sock.destroy(); } catch (_) {}
+          this.connections.delete(connectionId);
+        }, 200).unref();
+      }
+    };
+
+    const work = () => new Promise((resolve, reject) => {
       let output = '';
       let errorOutput = '';
 
-      const timeoutId = setTimeout(() => {
-        reject(new Error(`Command timeout after ${timeout}ms`));
-      }, timeout);
-
       conn.exec(command, (err, stream) => {
         if (err) {
-          clearTimeout(timeoutId);
           return reject(new Error(`Failed to execute command: ${err.message}`));
         }
+        activeStream = stream;
 
         stream
           .on('close', (code, signal) => {
-            clearTimeout(timeoutId);
+            // Skip the resolve path if our cancel destroyed the stream —
+            // withTimeout will reject with the timeout error.
+            if (stream.destroyed) return;
             resolve({
               content: [
                 {
@@ -495,6 +524,15 @@ class SSHMCPServer {
           });
       });
     });
+
+    try {
+      return await this.withTimeout(work, timeout, 'ssh_execute', cancel);
+    } catch (err) {
+      if (err && /timed out/.test(err.message)) {
+        this.connections.delete(connectionId);
+      }
+      throw err;
+    }
   }
 
   async handleSSHDisconnect(args) {
@@ -541,29 +579,63 @@ class SSHMCPServer {
   }
 
   // Wrap a promise-returning operation with a hard upper-bound timeout.
-  // ssh2 callback-style APIs don't expose a cancel handle we can rely on, so
-  // we can't always kill the in-flight work — but Promise.race guarantees the
-  // MCP call returns within `timeoutMs` so the AI caller isn't stuck waiting
-  // on a stalled connection.
-  withTimeout(promise, timeoutMs, label) {
-    let guardTimer;
-    const guard = new Promise((_, reject) => {
-      guardTimer = setTimeout(() => {
-        reject(new Error(`${label} timed out after ${timeoutMs}ms`));
+  //
+  // When the timer fires, BEFORE rejecting, we invoke `cancel()` (if provided)
+  // so the caller can stop the underlying in-flight work — destroy an SFTP
+  // stream, end a SFTP session, or ultimately destroy the SSH connection.
+  // The cancel callback is awaited briefly so the abort actually has a chance
+  // to propagate to the server; we still reject with a timeout error after
+  // `cancelGraceMs` so the MCP caller is never stuck waiting on a stalled
+  // connection.
+  //
+  // Signature: withTimeout(work, timeoutMs, label, cancel?)
+  //   work     : () => Promise<T>
+  //   cancel   : optional () => Promise<void> | void, called on timeout
+  withTimeout(work, timeoutMs, label, cancel) {
+    const cancelGraceMs = 500;
+
+    return new Promise((resolve, reject) => {
+      let finished = false;
+      const settle = (fn, value) => {
+        if (finished) return;
+        finished = true;
+        clearTimeout(guardTimer);
+        fn(value);
+      };
+
+      const guardTimer = setTimeout(async () => {
+        if (cancel) {
+          try {
+            await Promise.resolve(cancel());
+          } catch (e) {
+            // Best effort: log to stderr but don't override the timeout error.
+            // The MCP client gets the timeout regardless of cancel success.
+            console.error(`[${label}] cancel callback threw: ${e.message}`);
+          }
+        }
+        // Give the abort a brief moment to propagate before we reject, so
+        // any "destroyed"/"close" events from the underlying stream fire
+        // before the MCP layer returns to the caller. This avoids races
+        // where the work Promise still resolves successfully *after* the
+        // timeout error has been delivered.
+        setTimeout(() => {
+          settle(reject, new Error(`${label} timed out after ${timeoutMs}ms`));
+        }, cancelGraceMs);
       }, timeoutMs);
-    });
-    return Promise.race([promise, guard]).finally(() => {
-      clearTimeout(guardTimer);
+
+      work()
+        .then((result) => settle(resolve, result))
+        .catch((err) => settle(reject, err));
     });
   }
 
   async handleSSHExecuteScript(args) {
-    const { 
-      script, 
-      interpreter = 'bash', 
-      connectionId = 'default', 
+    const {
+      script,
+      interpreter = 'bash',
+      connectionId = 'default',
       timeout = 60000,
-      workingDir 
+      workingDir
     } = args;
 
     const conn = this.connections.get(connectionId);
@@ -571,26 +643,43 @@ class SSHMCPServer {
       throw new Error(`No active connection found for ID: ${connectionId}`);
     }
 
+    if (typeof timeout !== 'number' || !Number.isFinite(timeout) || timeout < 0) {
+      throw new Error(`Invalid timeout: must be a non-negative finite number of milliseconds (got ${timeout})`);
+    }
+
     // Extract code from blocks if present
     const cleanScript = this.extractCodeFromBlock(script);
 
-    return new Promise((resolve, reject) => {
+    // Two in-flight streams: the SFTP writeStream for the script upload
+    // and the exec stream once the upload completes. Cancel must clear
+    // whichever is active.
+    let activeStream = null;
+    const cancel = () => {
+      if (activeStream && !activeStream.destroyed) {
+        try { activeStream.destroy(new Error('timeout')); } catch (_) {}
+      }
+      try { conn.end(); } catch (_) {}
+      if (conn._sock && !conn._sock.destroyed) {
+        setTimeout(() => {
+          try { if (conn._sock && !conn._sock.destroyed) conn._sock.destroy(); } catch (_) {}
+          this.connections.delete(connectionId);
+        }, 200).unref();
+      }
+    };
+
+    const work = () => new Promise((resolve, reject) => {
       let output = '';
       let errorOutput = '';
-
-      const timeoutId = setTimeout(() => {
-        reject(new Error(`Script timeout after ${timeout}ms`));
-      }, timeout);
 
       // Create a temporary script file and execute it
       const scriptName = `mcp_temp_${Date.now()}.${interpreter === 'python' || interpreter === 'python3' ? 'py' : 'sh'}`;
       const remotePath = `/tmp/${scriptName}`;
-      
+
       // Prepare the script content with proper shebang
       let scriptContent = cleanScript;
       if (!scriptContent.startsWith('#!')) {
-        const shebang = interpreter === 'python' || interpreter === 'python3' 
-          ? '#!/usr/bin/env python3' 
+        const shebang = interpreter === 'python' || interpreter === 'python3'
+          ? '#!/usr/bin/env python3'
           : '#!/bin/bash';
         scriptContent = `${shebang}\n${scriptContent}`;
       }
@@ -598,28 +687,29 @@ class SSHMCPServer {
       // Upload script file
       conn.sftp((err, sftp) => {
         if (err) {
-          clearTimeout(timeoutId);
           return reject(new Error(`SFTP error: ${err.message}`));
         }
 
         const writeStream = sftp.createWriteStream(remotePath);
+        activeStream = writeStream;
         writeStream.write(scriptContent);
         writeStream.end();
 
         writeStream.on('close', () => {
+          if (writeStream.destroyed) return;
           // Make script executable and run it
           const cdCommand = workingDir ? `cd "${workingDir}" && ` : '';
           const command = `${cdCommand}chmod +x ${remotePath} && ${remotePath} && rm -f ${remotePath}`;
 
-          conn.exec(command, (err, stream) => {
-            if (err) {
-              clearTimeout(timeoutId);
-              return reject(new Error(`Failed to execute script: ${err.message}`));
+          conn.exec(command, (execErr, stream) => {
+            if (execErr) {
+              return reject(new Error(`Failed to execute script: ${execErr.message}`));
             }
+            activeStream = stream;
 
             stream
               .on('close', (code, signal) => {
-                clearTimeout(timeoutId);
+                if (stream.destroyed) return;
                 resolve({
                   content: [
                     {
@@ -638,17 +728,28 @@ class SSHMCPServer {
           });
         });
 
-        writeStream.on('error', (err) => {
-          clearTimeout(timeoutId);
-          reject(new Error(`Failed to upload script: ${err.message}`));
+        writeStream.on('error', (uploadErr) => {
+          // If our cancel destroyed the stream, let withTimeout reject
+          // with the timeout error.
+          if (writeStream.destroyed) return;
+          reject(new Error(`Failed to upload script: ${uploadErr.message}`));
         });
       });
     });
+
+    try {
+      return await this.withTimeout(work, timeout, 'ssh_execute_script', cancel);
+    } catch (err) {
+      if (err && /timed out/.test(err.message)) {
+        this.connections.delete(connectionId);
+      }
+      throw err;
+    }
   }
 
   async handleSSHUploadAndExecute(args) {
-    const { 
-      script, 
+    const {
+      script,
       filename = 'mcp_script.sh',
       interpreter = 'bash',
       connectionId = 'default',
@@ -661,24 +762,40 @@ class SSHMCPServer {
       throw new Error(`No active connection found for ID: ${connectionId}`);
     }
 
+    if (typeof timeout !== 'number' || !Number.isFinite(timeout) || timeout < 0) {
+      throw new Error(`Invalid timeout: must be a non-negative finite number of milliseconds (got ${timeout})`);
+    }
+
     // Extract code from blocks if present
     const cleanScript = this.extractCodeFromBlock(script);
 
-    return new Promise((resolve, reject) => {
+    // Same two-stream cancel as handleSSHExecuteScript: write stream
+    // for the script upload, exec stream once it's on disk.
+    let activeStream = null;
+    const cancel = () => {
+      if (activeStream && !activeStream.destroyed) {
+        try { activeStream.destroy(new Error('timeout')); } catch (_) {}
+      }
+      try { conn.end(); } catch (_) {}
+      if (conn._sock && !conn._sock.destroyed) {
+        setTimeout(() => {
+          try { if (conn._sock && !conn._sock.destroyed) conn._sock.destroy(); } catch (_) {}
+          this.connections.delete(connectionId);
+        }, 200).unref();
+      }
+    };
+
+    const work = () => new Promise((resolve, reject) => {
       let output = '';
       let errorOutput = '';
 
-      const timeoutId = setTimeout(() => {
-        reject(new Error(`Upload and execute timeout after ${timeout}ms`));
-      }, timeout);
-
       const remotePath = `/tmp/${basename(filename)}`;
-      
+
       // Prepare the script content
       let scriptContent = cleanScript;
       if (!scriptContent.startsWith('#!')) {
-        const shebang = interpreter === 'python' || interpreter === 'python3' 
-          ? '#!/usr/bin/env python3' 
+        const shebang = interpreter === 'python' || interpreter === 'python3'
+          ? '#!/usr/bin/env python3'
           : '#!/bin/bash';
         scriptContent = `${shebang}\n${scriptContent}`;
       }
@@ -686,28 +803,29 @@ class SSHMCPServer {
       // Upload script file
       conn.sftp((err, sftp) => {
         if (err) {
-          clearTimeout(timeoutId);
           return reject(new Error(`SFTP error: ${err.message}`));
         }
 
         const writeStream = sftp.createWriteStream(remotePath);
+        activeStream = writeStream;
         writeStream.write(scriptContent);
         writeStream.end();
 
         writeStream.on('close', () => {
+          if (writeStream.destroyed) return;
           // Make script executable and run it
           const cleanupCmd = cleanup ? ` && rm -f ${remotePath}` : '';
           const command = `chmod +x ${remotePath} && ${remotePath}${cleanupCmd}`;
 
-          conn.exec(command, (err, stream) => {
-            if (err) {
-              clearTimeout(timeoutId);
-              return reject(new Error(`Failed to execute uploaded script: ${err.message}`));
+          conn.exec(command, (execErr, stream) => {
+            if (execErr) {
+              return reject(new Error(`Failed to execute uploaded script: ${execErr.message}`));
             }
+            activeStream = stream;
 
             stream
               .on('close', (code, signal) => {
-                clearTimeout(timeoutId);
+                if (stream.destroyed) return;
                 resolve({
                   content: [
                     {
@@ -726,12 +844,21 @@ class SSHMCPServer {
           });
         });
 
-        writeStream.on('error', (err) => {
-          clearTimeout(timeoutId);
-          reject(new Error(`Failed to upload script: ${err.message}`));
+        writeStream.on('error', (uploadErr) => {
+          if (writeStream.destroyed) return;
+          reject(new Error(`Failed to upload script: ${uploadErr.message}`));
         });
       });
     });
+
+    try {
+      return await this.withTimeout(work, timeout, 'ssh_upload_and_execute', cancel);
+    } catch (err) {
+      if (err && /timed out/.test(err.message)) {
+        this.connections.delete(connectionId);
+      }
+      throw err;
+    }
   }
 
   async handleSSHUploadFile(args) {
@@ -746,9 +873,36 @@ class SSHMCPServer {
       throw new Error(`Invalid timeout: must be a non-negative finite number of milliseconds (got ${timeout})`);
     }
 
-    const absoluteLocalPath = resolve(localPath);
+    const absoluteLocalPath = pathResolve(localPath);
 
-    const work = new Promise((resolve, reject) => {
+    // Cancellation handle. Called by withTimeout when the timer fires.
+    // Tries, in order:
+    //   1. Destroy the in-flight SFTP write stream (closes the remote file
+    //      handle via SSH_FXP_CLOSE on the server, killing the transfer).
+    //   2. Gracefully end the SFTP session (closes all SFTP channels).
+    //   3. As a last resort, destroy the underlying SSH Client (forces the
+    //      server to abort via TCP close). Note: this also kills any other
+    //      in-flight operations on the same connectionId.
+    let activeStream = null;
+    const cancel = () => {
+      if (activeStream && !activeStream.destroyed) {
+        try { activeStream.destroy(new Error('timeout')); } catch (_) {}
+      }
+      try { conn.end(); } catch (_) {}
+      // If the connection itself looks wedged, force-destroy. This is the
+      // absolute last-resort: it tears down the TCP socket and the user
+      // will have to ssh_connect again.
+      if (conn._sock && !conn._sock.destroyed) {
+        // Schedule a forced destroy shortly after graceful end. If conn.end()
+        // already closed the socket cleanly, the destroy() is a no-op.
+        setTimeout(() => {
+          try { if (conn._sock && !conn._sock.destroyed) conn._sock.destroy(); } catch (_) {}
+          this.connections.delete(connectionId);
+        }, 200).unref();
+      }
+    };
+
+    const work = () => new Promise((resolve, reject) => {
       // Check if local file exists
       try {
         const fileContent = readFileSync(absoluteLocalPath);
@@ -760,10 +914,13 @@ class SSHMCPServer {
 
           const uploadFile = () => {
             const writeStream = sftp.createWriteStream(remotePath);
+            activeStream = writeStream;
             writeStream.write(fileContent);
             writeStream.end();
 
             writeStream.on('close', () => {
+              // Only resolve if not already settled by timeout.
+              if (writeStream.destroyed) return;
               resolve({
                 content: [
                   {
@@ -774,15 +931,26 @@ class SSHMCPServer {
               });
             });
 
-            writeStream.on('error', (err) => {
-              reject(new Error(`Upload failed: ${err.message}`));
+            writeStream.on('error', (writeErr) => {
+              // Our cancel destroyed the stream: let withTimeout reject
+              // with the timeout error.
+              if (writeStream.destroyed && writeErr && writeErr.message === 'timeout') {
+                return;
+              }
+              // Our cancel called conn.end() (graceful) before destroy
+              // could set the 'timeout' message: the stream then errors
+              // with a generic SFTP/SSH error. Treat as timeout too.
+              if (writeStream.destroyed) {
+                return;
+              }
+              reject(new Error(`Upload failed: ${writeErr.message}`));
             });
           };
 
           if (createDirs) {
             const remoteDir = dirname(remotePath);
             if (remoteDir !== '.' && remoteDir !== '/') {
-              sftp.mkdir(remoteDir, { recursive: true }, (err) => {
+              sftp.mkdir(remoteDir, { recursive: true }, (_mkdirErr) => {
                 // Ignore mkdir errors (directory might already exist)
                 uploadFile();
               });
@@ -798,7 +966,17 @@ class SSHMCPServer {
       }
     });
 
-    return this.withTimeout(work, timeout, 'ssh_upload_file');
+    try {
+      return await this.withTimeout(work, timeout, 'ssh_upload_file', cancel);
+    } catch (err) {
+      // Surface the timeout (or upload) error to the MCP caller. If we had
+      // to force-destroy the connection, drop it from the pool so the next
+      // call doesn't try to reuse a dead socket.
+      if (err && /timed out/.test(err.message)) {
+        this.connections.delete(connectionId);
+      }
+      throw err;
+    }
   }
 
   async handleSSHDownloadFile(args) {
@@ -813,9 +991,27 @@ class SSHMCPServer {
       throw new Error(`Invalid timeout: must be a non-negative finite number of milliseconds (got ${timeout})`);
     }
 
-    const absoluteLocalPath = resolve(localPath);
+    const absoluteLocalPath = pathResolve(localPath);
 
-    const work = new Promise((resolve, reject) => {
+    // Same multi-layer cancel strategy as upload:
+    //   1. Destroy the read stream (closes the remote file handle).
+    //   2. End the SFTP session.
+    //   3. Force-destroy the SSH socket as the last resort.
+    let activeStream = null;
+    const cancel = () => {
+      if (activeStream && !activeStream.destroyed) {
+        try { activeStream.destroy(new Error('timeout')); } catch (_) {}
+      }
+      try { conn.end(); } catch (_) {}
+      if (conn._sock && !conn._sock.destroyed) {
+        setTimeout(() => {
+          try { if (conn._sock && !conn._sock.destroyed) conn._sock.destroy(); } catch (_) {}
+          this.connections.delete(connectionId);
+        }, 200).unref();
+      }
+    };
+
+    const work = () => new Promise((resolve, reject) => {
       conn.sftp((err, sftp) => {
         if (err) {
           return reject(new Error(`SFTP error: ${err.message}`));
@@ -823,6 +1019,7 @@ class SSHMCPServer {
 
         const downloadFile = () => {
           const readStream = sftp.createReadStream(remotePath);
+          activeStream = readStream;
           let fileContent = Buffer.alloc(0);
 
           readStream.on('data', (chunk) => {
@@ -830,6 +1027,7 @@ class SSHMCPServer {
           });
 
           readStream.on('end', () => {
+            if (readStream.destroyed) return;
             try {
               writeFileSync(absoluteLocalPath, fileContent);
               resolve({
@@ -845,8 +1043,20 @@ class SSHMCPServer {
             }
           });
 
-          readStream.on('error', (err) => {
-            reject(new Error(`Download failed: ${err.message}`));
+          readStream.on('error', (readErr) => {
+            // Our cancel destroyed the stream: ignore and let withTimeout
+            // reject with the timeout error.
+            if (readStream.destroyed && readErr && readErr.message === 'timeout') {
+              return;
+            }
+            // Our cancel called conn.end() (graceful) before destroy had a
+            // chance to set the 'timeout' message: the stream then errors
+            // with a generic "No response from server" / "Connection lost"
+            // as the SFTP session closes. Treat this as the timeout too.
+            if (readStream.destroyed) {
+              return;
+            }
+            reject(new Error(`Download failed: ${readErr.message}`));
           });
         };
 
@@ -863,7 +1073,14 @@ class SSHMCPServer {
       });
     });
 
-    return this.withTimeout(work, timeout, 'ssh_download_file');
+    try {
+      return await this.withTimeout(work, timeout, 'ssh_download_file', cancel);
+    } catch (err) {
+      if (err && /timed out/.test(err.message)) {
+        this.connections.delete(connectionId);
+      }
+      throw err;
+    }
   }
 
   async handleSSHListFiles(args) {
@@ -878,20 +1095,38 @@ class SSHMCPServer {
       throw new Error(`Invalid timeout: must be a non-negative finite number of milliseconds (got ${timeout})`);
     }
 
-    const work = (async () => {
-      const sftp = await new Promise((resolve, reject) => {
-        conn.sftp((err, sftp) => {
-          if (err) {
-            return reject(new Error(`SFTP error: ${err.message}`));
+    // readdir is callback-based, not stream-based, and the SFTP object is
+    // an EventEmitter (not a stream) so sftp.end() does not exist. The
+    // cancel strategy is:
+    //   1. End the SSH Client (graceful — sends SSH_MSG_DISCONNECT and
+    //      closes the SFTP channel, which makes the pending readdir
+    //      request fail at the server side).
+    //   2. Force-destroy the underlying socket if the graceful end
+    //      doesn't complete quickly enough.
+    const cancel = () => {
+      try { conn.end(); } catch (_) {}
+      if (conn._sock && !conn._sock.destroyed) {
+        setTimeout(() => {
+          try { if (conn._sock && !conn._sock.destroyed) conn._sock.destroy(); } catch (_) {}
+          this.connections.delete(connectionId);
+        }, 200).unref();
+      }
+    };
+
+    const work = async () => {
+      const sftpSession = await new Promise((resolve, reject) => {
+        conn.sftp((sftpErr, sftp) => {
+          if (sftpErr) {
+            return reject(new Error(`SFTP error: ${sftpErr.message}`));
           }
           resolve(sftp);
         });
       });
 
-      const list = await new Promise((resolve, reject) => {
-        sftp.readdir(remotePath, (err, list) => {
-          if (err) {
-            return reject(new Error(`Failed to list directory: ${err.message}`));
+      const entries = await new Promise((resolve, reject) => {
+        sftpSession.readdir(remotePath, (readdirErr, list) => {
+          if (readdirErr) {
+            return reject(new Error(`Failed to list directory: ${readdirErr.message}`));
           }
           resolve(list);
         });
@@ -903,7 +1138,7 @@ class SSHMCPServer {
         output += 'Permissions  Size     Modified                Name\n';
         output += '-'.repeat(60) + '\n';
 
-        list.forEach(item => {
+        entries.forEach(item => {
           const isDir = item.attrs.isDirectory() ? 'd' : '-';
           const perms = item.attrs.mode ? (item.attrs.mode & parseInt('777', 8)).toString(8).padStart(3, '0') : '???';
           const size = item.attrs.size ? item.attrs.size.toString().padStart(8) : '???';
@@ -912,8 +1147,8 @@ class SSHMCPServer {
           output += `${isDir}${perms}      ${size}   ${mtime}  ${item.filename}\n`;
         });
       } else {
-        const dirs = list.filter(item => item.attrs.isDirectory()).map(item => item.filename + '/');
-        const files = list.filter(item => !item.attrs.isDirectory()).map(item => item.filename);
+        const dirs = entries.filter(item => item.attrs.isDirectory()).map(item => item.filename + '/');
+        const files = entries.filter(item => !item.attrs.isDirectory()).map(item => item.filename);
 
         if (dirs.length > 0) {
           output += 'Directories:\n';
@@ -939,9 +1174,16 @@ class SSHMCPServer {
           },
         ],
       };
-    })();
+    };
 
-    return this.withTimeout(work, timeout, 'ssh_list_files');
+    try {
+      return await this.withTimeout(work, timeout, 'ssh_list_files', cancel);
+    } catch (err) {
+      if (err && /timed out/.test(err.message)) {
+        this.connections.delete(connectionId);
+      }
+      throw err;
+    }
   }
 
   async run() {
@@ -950,6 +1192,32 @@ class SSHMCPServer {
     console.error('SSH MCP Server running on stdio');
   }
 }
+
+// Swallow expected network errors that fire on the SSH/TCP socket when
+// we cancel a transfer (force-destroy) or the remote peer closes. These
+// race with our cancel callbacks and would otherwise crash the MCP
+// process. Real bugs will still surface as uncaughtException in
+// handlers we haven't wrapped; only the well-known network errors
+// are silenced.
+process.on('uncaughtException', (err) => {
+  const msg = (err && err.message) || String(err);
+  if (/ECONNRESET|ECONNABORTED|EPIPE|ERR_STREAM_DESTROYED|read|write/.test(msg)) {
+    console.error(`[swallow] uncaughtException (network): ${msg}`);
+    return;
+  }
+  // Unknown error: re-raise so the user notices.
+  console.error(`[fatal] uncaughtException: ${msg}`);
+  process.exit(1);
+});
+process.on('unhandledRejection', (reason) => {
+  const msg = (reason && reason.message) || String(reason);
+  if (/ECONNRESET|ECONNABORTED|EPIPE|ERR_STREAM_DESTROYED/.test(msg)) {
+    console.error(`[swallow] unhandledRejection (network): ${msg}`);
+    return;
+  }
+  console.error(`[fatal] unhandledRejection: ${msg}`);
+  process.exit(1);
+});
 
 // Handle --install flag: auto-configure Claude CLI with the correct platform-specific command
 if (process.argv.includes('--install')) {
